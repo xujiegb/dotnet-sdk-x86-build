@@ -142,23 +142,40 @@ jobs:
         version="${{ inputs.apphost_version }}"
 
         if [ -z "$version" ]; then
-          echo "未手动指定版本号，尝试从 PackageVersions.runtime.props 自动探测..."
-          props_file=$(find ${{ github.workspace }}/dotnet/artifacts/obj/PackageVersions -iname 'PackageVersions.runtime.props' 2>/dev/null | head -n1)
-          if [ -n "$props_file" ]; then
-            echo "找到文件: $props_file，内容中含 AppHost 关键字的行："
-            grep -i "apphost" "$props_file" || echo "(没有匹配到 apphost 关键字，说明属性命名可能不同，需要人工查看整份文件)"
-            # 尝试提取形如 <XxxAppHostXxxVersion>1.2.3</XxxAppHostXxxVersion> 的值，这是最常见的 msbuild 属性写法
-            version=$(grep -i -o '<[A-Za-z]*AppHost[A-Za-z]*Version>[^<]*<' "$props_file" | head -n1 | sed -E 's/.*>([^<]+)</\1/')
+          echo "未手动指定版本号，改用更可靠的方式：直接从本次构建自己产出的 Shipping nupkg 文件名提取版本号"
+          echo "（同一次构建产出的所有包共享同一个产品版本号，这个版本号就是 AppHost 包也应该用的版本号，"
+          echo "  不需要去猜 msbuild 内部属性名，也不需要去查 NuGet.org 上 linux-x64 的版本，直接用自己构建出的即可）"
+
+          shipping_dir="${{ github.workspace }}/dotnet/artifacts/packages/Release/Shipping"
+
+          # 优先找同 RID 的 runtime 包（如果这次构建有产出的话），版本号最贴合目标场景
+          sample_pkg=$(find "$shipping_dir" -iname 'Microsoft.NETCore.App.Runtime.linux-x86.*.nupkg' 2>/dev/null | head -n1)
+
+          # 找不到就退而求其次，随便挑一个已知稳定命名、不含 RID 后缀歧义的包（例如 System.Text.Json）
+          if [ -z "$sample_pkg" ]; then
+            sample_pkg=$(find "$shipping_dir" -iname 'System.Text.Json.*.nupkg' ! -iname '*.symbols.nupkg' 2>/dev/null | head -n1)
+          fi
+
+          # 再兜底：随便找一个 Shipping 目录下的 nupkg
+          if [ -z "$sample_pkg" ]; then
+            sample_pkg=$(find "$shipping_dir" -iname '*.nupkg' ! -iname '*.symbols.nupkg' 2>/dev/null | head -n1)
+          fi
+
+          if [ -n "$sample_pkg" ]; then
+            echo "参考包: $sample_pkg"
+            filename=$(basename "$sample_pkg" .nupkg)
+            # 从文件名末尾提取版本号：形如 Name.1.2.3 或 Name.1.2.3-servicing.xxxx.xx
+            version=$(echo "$filename" | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$')
           else
-            echo "::warning::未找到 PackageVersions.runtime.props，可能路径变化，请人工在 pass 1 产物里搜索版本信息"
+            echo "::warning::在 $shipping_dir 下没有找到任何 Shipping nupkg，可能第一趟构建在产出这些包之前就失败了"
           fi
         fi
 
         if [ -z "$version" ]; then
           echo "::error::无法确定 Microsoft.NETCore.App.Host.linux-x86 应使用的版本号。"
-          echo "请手动做以下任一操作后重跑本 workflow："
-          echo "  1) 查看上面 grep 出的 PackageVersions.runtime.props 内容，找到 AppHost 相关版本号，通过 apphost_version 输入参数手动传入；"
-          echo "  2) 或者查看 pass 1 完整日志中 NETSDK1084 报错附近，看 restore 阶段具体请求的是哪个版本。"
+          echo "请手动做以下任一操作后通过 apphost_version 输入参数重跑："
+          echo "  1) 查看 ${{ github.workspace }}/dotnet/artifacts/packages/Release/Shipping/ 目录下任意一个 nupkg 的文件名，把末尾的版本号抄出来；"
+          echo "  2) 或者去 https://www.nuget.org/packages/Microsoft.NETCore.App.Host.linux-x64 查这次要构建的 .NET 版本对应的号码（仅作参考，最好还是用第 1 条实测的版本号）。"
           exit 1
         fi
 
