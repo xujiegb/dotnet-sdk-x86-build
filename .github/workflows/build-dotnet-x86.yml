@@ -34,12 +34,6 @@ jobs:
           - name: linux
             libc: glibc
             docker_tag: azurelinux-3.0-net10.0-cross-x86
-          # 如果需要 musl 版本，musl 官方对 x86(32位) 的支持较少，
-          # 请先在 mcr.microsoft.com/dotnet-buildtools/prereqs 确认是否存在对应 tag，
-          # 例如 azurelinux-3.0-net10.0-cross-x86-musl，确认存在后再取消注释：
-          # - name: linux-musl
-          #   libc: musl
-          #   docker_tag: azurelinux-3.0-net10.0-cross-x86-musl
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -61,21 +55,45 @@ jobs:
         remove-codeql: 'true'
         remove-cached-tools: 'true'
 
+    # 新增：分配 12GB Swap，防止 7GB 物理内存被 .NET 源码编译撑爆
+    - name: Set up Swap Space
+      run: |
+        sudo fallocate -l 12G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        echo "=== Current Memory & Swap ==="
+        free -h
+
     - name: Clone repository
       run: |
         git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
 
-    # 注意：原 riscv64 workflow 里的两个补丁（TLS 优化关闭 & march/mabi pin）
-    # 都是 riscv64 专属问题（linux-musl-riscv64 的 initial-exec TLS 兼容性,
-    # 以及 riscv64 编译器基线漂移），x86 不存在这些问题，因此这里不需要打补丁。
-    # 如果之后 x86 构建过程中遇到类似的架构专属编译错误，可以在这里按需添加对应补丁。
-
     - name: Build
       run: |
-        docker run --platform linux/amd64 --rm -v${{ github.workspace }}/dotnet:/dotnet -w /dotnet -e ROOTFS_DIR=/crossrootfs/x86 \
+        docker run --platform linux/amd64 --rm \
+          -v ${{ github.workspace }}/dotnet:/dotnet \
+          -w /dotnet \
+          -e ROOTFS_DIR=/crossrootfs/x86 \
+          -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+          -e MSBUILDDISABLENODEREUSE=1 \
           mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
-            ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x86 \
-              --arch x86 --branding ${{ inputs.branding }} -p:OfficialBuildId=$(date +%Y%m%d).99
+            ./build.sh --clean-while-building --prep -sb \
+              --os ${{ matrix.name }} \
+              --rid ${{ matrix.name }}-x86 \
+              --arch x86 \
+              --branding ${{ inputs.branding }} \
+              -p:OfficialBuildId=$(date +%Y%m%d).99 \
+              -p:MaxCpuCount=2
+
+    # 新增：无论构建成功还是失败/中断，都打印内核 OOM 日志和内存状态
+    - name: Check OOM & System Logs
+      if: always()
+      run: |
+        echo "=== Final Memory Status ==="
+        free -h
+        echo "=== Kernel OOM Killer Logs ==="
+        sudo dmesg -T | grep -i -E "oom|killed" || echo "No OOM events found in kernel log."
 
     - name: List assets directory
       run: |
@@ -104,7 +122,6 @@ jobs:
       run: |
         sudo apt install -y hub
 
-        # hub(1) requires release to be created inside a git repo
         git clone https://${{ secrets.CLONE_TOKEN }}:x-oauth-basic@github.com/${{ github.repository }}.git repo
         cd repo
 
@@ -112,7 +129,6 @@ jobs:
         artifacts=""
         for sdk_path in $sdk_paths; do
           sdk_filename=$(basename "$sdk_path")
-          # Extract version: strip prefix/suffix to get e.g. "10.0.100-preview.5.25277.114"
           sdk_version=$(echo "$sdk_filename" | sed -E 's/dotnet-sdk-([^-]+(-[^-]+)*)-linux-.+\.tar\.gz/\1/')
           artifacts="$artifacts -a $sdk_path"
           tag_name="$sdk_version"
@@ -121,7 +137,6 @@ jobs:
         echo "tag_name: $tag_name"
         echo "artifacts: $artifacts"
 
-        # docs: https://hub.github.com/hub-release.1.html
         hub release create $artifacts --prerelease -m "$tag_name" "$tag_name"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
