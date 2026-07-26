@@ -75,7 +75,7 @@ jobs:
               --arch x86 \
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
-              -p:MaxCpuCount=2
+              -p:MaxCpuCount=3
 
     # 新增：无论构建成功还是失败/中断，都打印内核 OOM 日志和内存状态
     - name: Check OOM & System Logs
