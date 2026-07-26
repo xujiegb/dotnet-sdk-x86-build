@@ -170,6 +170,7 @@ jobs:
 
     - name: Pack Microsoft.NETCore.App.Host.linux-x86
       run: |
+        export PATH="${{ github.workspace }}/x64-sdk-probe:$PATH"
         cat > ${{ github.workspace }}/apphost-pack/pack.csproj << EOF
         <Project Sdk="Microsoft.Build.NoTargets/3.7.56">
           <PropertyGroup>
