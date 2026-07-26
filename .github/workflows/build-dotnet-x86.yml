@@ -123,6 +123,12 @@ jobs:
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
               -p:MaxCpuCount=3 \
+              -p:BuildArchitecture=x64 \
+              -p:TargetArchitecture=x86 \
+              -p:TargetOS=linux \
+              -p:TargetRid=linux-x86 \
+              -p:SourceBuildTargetRid=linux-x86 \
+              -p:CrossBuild=true \
         || echo "构建按预期在 AppHost restore 处失败（如果是其他原因失败，下面找不到 apphost 二进制时会报错并停止）"
 
         # 在 native corehost 构建产物里找 32 位 ELF 的 apphost 文件。
@@ -189,6 +195,12 @@ jobs:
         cd ${{ github.workspace }}/apphost-pack
         dotnet pack pack.csproj -c Release -o out
         cp out/*.nupkg ${{ github.workspace }}/local-feed/
+
+        # 搜集第一趟构建中产出的纯源码 nupkg（包含 App.Runtime 包）塞入 local-feed，消除第二趟构建的 NU1202
+        echo "正在搜集 Pass 1 源码构建产出的本地 nupkg..."
+        find ${{ github.workspace }}/dotnet/artifacts/packages/ -name '*.nupkg' -exec cp {} ${{ github.workspace }}/local-feed/ \; 2>/dev/null || true
+        find ${{ github.workspace }}/dotnet/src/runtime/artifacts/packages/ -name '*.nupkg' -exec cp {} ${{ github.workspace }}/local-feed/ \; 2>/dev/null || true
+
         echo "本地 feed 目录内容："
         ls -la ${{ github.workspace }}/local-feed/
 
@@ -214,7 +226,13 @@ jobs:
               --arch x86 \
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
-              -p:MaxCpuCount=3
+              -p:MaxCpuCount=3 \
+              -p:BuildArchitecture=x64 \
+              -p:TargetArchitecture=x86 \
+              -p:TargetOS=linux \
+              -p:TargetRid=linux-x86 \
+              -p:SourceBuildTargetRid=linux-x86 \
+              -p:CrossBuild=true
 
     # 无论构建成功还是失败/中断，都打印内核 OOM 日志和内存状态
     - name: Check OOM & System Logs
