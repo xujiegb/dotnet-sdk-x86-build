@@ -60,6 +60,18 @@ jobs:
       run: |
         git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
 
+    - name: Disable UseAppHost for linux-x86 (NETSDK1084 workaround)
+      run: |
+        cat > ${{ github.workspace }}/dotnet/Directory.Build.props << 'EOF'
+        <Project>
+          <PropertyGroup>
+            <UseAppHost>false</UseAppHost>
+          </PropertyGroup>
+        </Project>
+        EOF
+        echo "Written Directory.Build.props:"
+        cat ${{ github.workspace }}/dotnet/Directory.Build.props
+
     - name: Build
       run: |
         docker run --platform linux/amd64 --rm \
