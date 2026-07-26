@@ -1,0 +1,72 @@
+name: Build .NET SDK (linux-x86) - Experiment raw property passthrough
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: 'dotnet VMR fork name'
+        required: true
+        type: string
+        default: dotnet
+      branch:
+        description: 'dotnet VMR branch name'
+        required: true
+        type: string
+        default: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Show workflow inputs
+      run: |
+        echo "fork: ${{ inputs.fork }}"
+        echo "branch: ${{ inputs.branch }}"
+
+    - name: Maximize build space
+      uses: AdityaGarg8/remove-unwanted-software@v4.1
+      with:
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-cached-tools: 'true'
+
+    - name: Clone repository
+      run: |
+        git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
+
+    # 实验性调用方式：模仿 Termux 那份脚本的调用形状，不用 --prep -sb --os/--rid/--arch
+    # 这套"产品构建快捷参数"，改用原始 MSBuild 属性透传（-- /p:...），保留 CoreCLR
+    # （不加 --use-mono-runtime），只是想验证是否是入口调用方式本身绕开了
+    # "bootstrap 清理阶段二次 restore 校验 AppHost"这个环节。
+    - name: Build (实验：--source-build --online -- 原始属性透传)
+      run: |
+        docker run --platform linux/amd64 --rm \
+          -v ${{ github.workspace }}/dotnet:/dotnet \
+          -w /dotnet \
+          -e ROOTFS_DIR=/crossrootfs/x86 \
+          -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+          -e MSBUILDDISABLENODEREUSE=1 \
+          mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-net10.0-cross-x86 \
+            ./build.sh --clean-while-building --source-build --online \
+              -- \
+              /p:TargetRid=linux-x86 \
+              /p:TargetArchitecture=x86 \
+              /p:Configuration=Release \
+              /p:SkipErrorOnPrebuilts=true \
+              /p:MaxCpuCount=3
+
+    - name: List assets directory
+      if: always()
+      run: |
+        find "${{ github.workspace }}/dotnet/artifacts" 2>/dev/null || echo "artifacts 目录不存在，构建可能在很早期就失败了"
+
+    - name: Upload logs for inspection
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: experiment-logs
+        path: |
+          ${{ github.workspace }}/dotnet/artifacts/log/**/*.log
+        if-no-files-found: warn
