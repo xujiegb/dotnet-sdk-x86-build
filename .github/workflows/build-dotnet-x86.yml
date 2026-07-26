@@ -45,7 +45,6 @@ jobs:
         echo "branch: ${{ inputs.branch }}"
         echo "branding: ${{ inputs.branding }}"
         echo "release: ${{ inputs.release }}"
-
     - name: Maximize build space
       uses: AdityaGarg8/remove-unwanted-software@v4.1
       with:
@@ -58,26 +57,22 @@ jobs:
     - name: Clone repository
       run: |
         git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
-
     - name: Prepare local NuGet feed for AppHost pack
       run: |
         # 建一个空的本地 feed 目录，第一趟构建时它是空的（不影响，反正第一趟本来就预期失败），
         # 第二趟构建前会把打好的 apphost nupkg 放进来。
         mkdir -p ${{ github.workspace }}/local-feed
-
         NUGET_CONFIG="${{ github.workspace }}/dotnet/NuGet.config"
         if [ ! -f "$NUGET_CONFIG" ]; then
           echo "::error::未在预期路径找到 NuGet.config，请检查 VMR 仓库结构是否变化"
           find ${{ github.workspace }}/dotnet -maxdepth 2 -iname 'NuGet.config'
           exit 1
         fi
-
         # 在 <packageSources> 标签后插入本地 feed 源。
         # 容器内挂载路径是 /dotnet-local-feed（见下面 docker run 的 -v 参数）。
         sed -i 's#<packageSources>#<packageSources>\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$NUGET_CONFIG"
         echo "Patched NuGet.config (相关行):"
         grep -B1 -A1 "local-apphost-feed" "$NUGET_CONFIG"
-
     - name: Download official linux-x64 SDK for local AppHost version probing
       run: |
         # 直接下载官方 linux-x64 SDK 到本地并解压，从其 packs 目录里
@@ -86,7 +81,6 @@ jobs:
         # 不依赖解析任何 NuGet API 返回内容，也不用去猜内部 msbuild 属性名。
         curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
         chmod +x dotnet-install.sh
-
         case "${{ inputs.branding }}" in
           release)
             quality_arg=""
@@ -98,14 +92,11 @@ jobs:
             quality_arg="--quality daily"
             ;;
         esac
-
         mkdir -p ${{ github.workspace }}/x64-sdk-probe
         ./dotnet-install.sh --channel 10.0 $quality_arg --architecture x64 --os linux \
           --install-dir ${{ github.workspace }}/x64-sdk-probe --no-path
-
         echo "下载完成，packs 目录内容："
         find ${{ github.workspace }}/x64-sdk-probe/packs -maxdepth 1 -iname 'Microsoft.NETCore.App.Host.linux-x64*' 2>/dev/null || true
-
     - name: Build & locate apphost binary (第一次构建预期在 AppHost restore 处失败，构建本身产出的 apphost 二进制不受影响)
       run: |
         docker run --platform linux/amd64 --rm \
@@ -124,7 +115,6 @@ jobs:
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
               -p:MaxCpuCount=3 \
         || echo "构建按预期在 AppHost restore 处失败（如果是其他原因失败，下面找不到 apphost 二进制时会报错并停止）"
-
         # 在 native corehost 构建产物里找 32 位 ELF 的 apphost 文件。
         found=""
         while IFS= read -r f; do
@@ -133,41 +123,42 @@ jobs:
             break
           fi
         done < <(find ${{ github.workspace }}/dotnet/src/runtime/artifacts -type f -name 'apphost' 2>/dev/null)
-
         if [ -z "$found" ]; then
           echo "::error::未找到 32-bit ELF 的 apphost 二进制。可能构建在生成 apphost 之前就失败了（比如 CMake/编译阶段本身出错），需要先看上面的构建日志排查，而不是继续走本流程。"
           echo "artifacts 下所有名为 apphost* 的文件："
           find ${{ github.workspace }}/dotnet/src/runtime/artifacts -iname 'apphost*' 2>/dev/null || true
           exit 1
         fi
-
         echo "Found apphost: $found"
         file "$found"
         mkdir -p ${{ github.workspace }}/apphost-pack/runtimes/linux-x86/native
         cp "$found" ${{ github.workspace }}/apphost-pack/runtimes/linux-x86/native/apphost
         chmod +x ${{ github.workspace }}/apphost-pack/runtimes/linux-x86/native/apphost
-
     - name: Determine expected AppHost package version (从本地已下载的 x64 SDK 探测)
       id: apphost_ver
       run: |
         pack_dir="${{ github.workspace }}/x64-sdk-probe/packs/Microsoft.NETCore.App.Host.linux-x64"
-
         if [ ! -d "$pack_dir" ]; then
           echo "::error::未在下载的 x64 SDK 里找到 Microsoft.NETCore.App.Host.linux-x64 pack 目录，请检查上一步 SDK 下载是否成功"
           find ${{ github.workspace }}/x64-sdk-probe/packs -maxdepth 1 2>/dev/null || true
           exit 1
         fi
-
         version=$(ls "$pack_dir" | head -n1)
-
         if [ -z "$version" ]; then
           echo "::error::pack 目录存在但为空，无法提取版本号"
           exit 1
         fi
-
         echo "从本地 x64 SDK 探测到版本号: $version"
         echo "version=$version" >> "$GITHUB_OUTPUT"
-
+    # 新增：因为前面 "Maximize build space" 把 host 上预装的 dotnet 删掉了，
+    # 这里用之前已经下载好的 dotnet-install.sh 临时装一个最小 SDK 到 host，
+    # 专门给下一步 "dotnet pack" 用（跟容器内构建用的 dotnet 互不影响）。
+    - name: Install temporary dotnet SDK on host (for packing only)
+      run: |
+        ./dotnet-install.sh --channel 10.0 --install-dir ${{ github.workspace }}/host-dotnet --no-path
+        echo "${{ github.workspace }}/host-dotnet" >> "$GITHUB_PATH"
+        echo "临时 host dotnet 安装完成："
+        ${{ github.workspace }}/host-dotnet/dotnet --info
     - name: Pack Microsoft.NETCore.App.Host.linux-x86
       run: |
         cat > ${{ github.workspace }}/apphost-pack/pack.csproj << EOF
@@ -184,13 +175,11 @@ jobs:
           </ItemGroup>
         </Project>
         EOF
-
         cd ${{ github.workspace }}/apphost-pack
         dotnet pack pack.csproj -c Release -o out
         cp out/*.nupkg ${{ github.workspace }}/local-feed/
         echo "本地 feed 目录内容："
         ls -la ${{ github.workspace }}/local-feed/
-
     - name: Upload AppHost pack (可用于日后编译 v2rayN 等自包含发布)
       uses: actions/upload-artifact@v4
       with:
@@ -214,7 +203,6 @@ jobs:
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
               -p:MaxCpuCount=3
-
     # 无论构建成功还是失败/中断，都打印内核 OOM 日志和内存状态
     - name: Check OOM & System Logs
       if: always()
@@ -223,18 +211,15 @@ jobs:
         free -h
         echo "=== Kernel OOM Killer Logs ==="
         sudo dmesg -T | grep -i -E "oom|killed" || echo "No OOM events found in kernel log."
-
     - name: List assets directory
       run: |
         find "${{ github.workspace }}/dotnet/artifacts"
-
     - name: Upload .NET
       uses: actions/upload-artifact@v4
       with:
         name: dotnet-sdk-${{ matrix.name }}
         path: |
           ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
-
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -250,10 +235,8 @@ jobs:
     - name: Make release
       run: |
         sudo apt install -y hub
-
         git clone https://${{ secrets.CLONE_TOKEN }}:x-oauth-basic@github.com/${{ github.repository }}.git repo
         cd repo
-
         sdk_paths=$(find ${{ github.workspace }}/artifacts -name 'dotnet-sdk-*.tar.gz')
         artifacts=""
         for sdk_path in $sdk_paths; do
@@ -262,10 +245,8 @@ jobs:
           artifacts="$artifacts -a $sdk_path"
           tag_name="$sdk_version"
         done
-
         echo "tag_name: $tag_name"
         echo "artifacts: $artifacts"
-
         hub release create $artifacts --prerelease -m "$tag_name" "$tag_name"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
