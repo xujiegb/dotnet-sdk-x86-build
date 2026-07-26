@@ -25,11 +25,6 @@ on:
       release:
         description: 'publish release'
         type: boolean
-      apphost_version:
-        description: '手动指定 Microsoft.NETCore.App.Host.linux-x86 的版本号（留空则尝试自动探测，探测失败会报错要求手填）'
-        required: false
-        type: string
-        default: ''
 
 jobs:
   build:
@@ -50,7 +45,6 @@ jobs:
         echo "branch: ${{ inputs.branch }}"
         echo "branding: ${{ inputs.branding }}"
         echo "release: ${{ inputs.release }}"
-        echo "apphost_version (手动指定，可为空): ${{ inputs.apphost_version }}"
 
     - name: Maximize build space
       uses: AdityaGarg8/remove-unwanted-software@v4.1
@@ -84,9 +78,35 @@ jobs:
         echo "Patched NuGet.config (相关行):"
         grep -B1 -A1 "local-apphost-feed" "$NUGET_CONFIG"
 
-    - name: Build (pass 1 - 预期在 AppHost restore 处失败，用于提取 apphost 二进制和版本信息)
-      id: build_pass1
-      continue-on-error: true
+    - name: Download official linux-x64 SDK for local AppHost version probing
+      run: |
+        # 直接下载官方 linux-x64 SDK 到本地并解压，从其 packs 目录里
+        # Microsoft.NETCore.App.Host.linux-x64/<版本号> 这个文件夹名，
+        # 直接读出官方给这次对应版本使用的确切版本号。全程本地文件系统操作，
+        # 不依赖解析任何 NuGet API 返回内容，也不用去猜内部 msbuild 属性名。
+        curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+        chmod +x dotnet-install.sh
+
+        case "${{ inputs.branding }}" in
+          release)
+            quality_arg=""
+            ;;
+          preview)
+            quality_arg="--quality preview"
+            ;;
+          *)
+            quality_arg="--quality daily"
+            ;;
+        esac
+
+        mkdir -p ${{ github.workspace }}/x64-sdk-probe
+        ./dotnet-install.sh --channel 10.0 $quality_arg --architecture x64 --os linux \
+          --install-dir ${{ github.workspace }}/x64-sdk-probe --no-path
+
+        echo "下载完成，packs 目录内容："
+        find ${{ github.workspace }}/x64-sdk-probe/packs -maxdepth 1 -iname 'Microsoft.NETCore.App.Host.linux-x64*' 2>/dev/null || true
+
+    - name: Build & locate apphost binary (第一次构建预期在 AppHost restore 处失败，构建本身产出的 apphost 二进制不受影响)
       run: |
         docker run --platform linux/amd64 --rm \
           -v ${{ github.workspace }}/dotnet:/dotnet \
@@ -102,18 +122,9 @@ jobs:
               --arch x86 \
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
-              -p:MaxCpuCount=3
+              -p:MaxCpuCount=3 \
+        || echo "构建按预期在 AppHost restore 处失败（如果是其他原因失败，下面找不到 apphost 二进制时会报错并停止）"
 
-    - name: Check pass 1 outcome
-      run: |
-        if [ "${{ steps.build_pass1.outcome }}" = "success" ]; then
-          echo "第一趟构建居然直接成功了（说明这次环境本身就有 AppHost pack，或者上游已修复），后面步骤仍会正常执行，不影响结果。"
-        else
-          echo "第一趟构建按预期失败（用于收集 apphost 二进制），继续后续步骤。"
-        fi
-
-    - name: Locate apphost binary from pass 1
-      run: |
         # 在 native corehost 构建产物里找 32 位 ELF 的 apphost 文件。
         found=""
         while IFS= read -r f; do
@@ -124,7 +135,7 @@ jobs:
         done < <(find ${{ github.workspace }}/dotnet/src/runtime/artifacts -type f -name 'apphost' 2>/dev/null)
 
         if [ -z "$found" ]; then
-          echo "::error::未找到 32-bit ELF 的 apphost 二进制。可能第一趟构建在生成 apphost 之前就失败了（比如 CMake/编译阶段本身出错），需要先看 pass 1 日志排查，而不是继续走本流程。"
+          echo "::error::未找到 32-bit ELF 的 apphost 二进制。可能构建在生成 apphost 之前就失败了（比如 CMake/编译阶段本身出错），需要先看上面的构建日志排查，而不是继续走本流程。"
           echo "artifacts 下所有名为 apphost* 的文件："
           find ${{ github.workspace }}/dotnet/src/runtime/artifacts -iname 'apphost*' 2>/dev/null || true
           exit 1
@@ -136,50 +147,25 @@ jobs:
         cp "$found" ${{ github.workspace }}/apphost-pack/runtimes/linux-x86/native/apphost
         chmod +x ${{ github.workspace }}/apphost-pack/runtimes/linux-x86/native/apphost
 
-    - name: Determine expected AppHost package version
+    - name: Determine expected AppHost package version (从本地已下载的 x64 SDK 探测)
       id: apphost_ver
       run: |
-        version="${{ inputs.apphost_version }}"
+        pack_dir="${{ github.workspace }}/x64-sdk-probe/packs/Microsoft.NETCore.App.Host.linux-x64"
 
-        if [ -z "$version" ]; then
-          echo "未手动指定版本号，改用更可靠的方式：直接从本次构建自己产出的 Shipping nupkg 文件名提取版本号"
-          echo "（同一次构建产出的所有包共享同一个产品版本号，这个版本号就是 AppHost 包也应该用的版本号，"
-          echo "  不需要去猜 msbuild 内部属性名，也不需要去查 NuGet.org 上 linux-x64 的版本，直接用自己构建出的即可）"
-
-          shipping_dir="${{ github.workspace }}/dotnet/artifacts/packages/Release/Shipping"
-
-          # 优先找同 RID 的 runtime 包（如果这次构建有产出的话），版本号最贴合目标场景
-          sample_pkg=$(find "$shipping_dir" -iname 'Microsoft.NETCore.App.Runtime.linux-x86.*.nupkg' 2>/dev/null | head -n1)
-
-          # 找不到就退而求其次，随便挑一个已知稳定命名、不含 RID 后缀歧义的包（例如 System.Text.Json）
-          if [ -z "$sample_pkg" ]; then
-            sample_pkg=$(find "$shipping_dir" -iname 'System.Text.Json.*.nupkg' ! -iname '*.symbols.nupkg' 2>/dev/null | head -n1)
-          fi
-
-          # 再兜底：随便找一个 Shipping 目录下的 nupkg
-          if [ -z "$sample_pkg" ]; then
-            sample_pkg=$(find "$shipping_dir" -iname '*.nupkg' ! -iname '*.symbols.nupkg' 2>/dev/null | head -n1)
-          fi
-
-          if [ -n "$sample_pkg" ]; then
-            echo "参考包: $sample_pkg"
-            filename=$(basename "$sample_pkg" .nupkg)
-            # 从文件名末尾提取版本号：形如 Name.1.2.3 或 Name.1.2.3-servicing.xxxx.xx
-            version=$(echo "$filename" | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$')
-          else
-            echo "::warning::在 $shipping_dir 下没有找到任何 Shipping nupkg，可能第一趟构建在产出这些包之前就失败了"
-          fi
-        fi
-
-        if [ -z "$version" ]; then
-          echo "::error::无法确定 Microsoft.NETCore.App.Host.linux-x86 应使用的版本号。"
-          echo "请手动做以下任一操作后通过 apphost_version 输入参数重跑："
-          echo "  1) 查看 ${{ github.workspace }}/dotnet/artifacts/packages/Release/Shipping/ 目录下任意一个 nupkg 的文件名，把末尾的版本号抄出来；"
-          echo "  2) 或者去 https://www.nuget.org/packages/Microsoft.NETCore.App.Host.linux-x64 查这次要构建的 .NET 版本对应的号码（仅作参考，最好还是用第 1 条实测的版本号）。"
+        if [ ! -d "$pack_dir" ]; then
+          echo "::error::未在下载的 x64 SDK 里找到 Microsoft.NETCore.App.Host.linux-x64 pack 目录，请检查上一步 SDK 下载是否成功"
+          find ${{ github.workspace }}/x64-sdk-probe/packs -maxdepth 1 2>/dev/null || true
           exit 1
         fi
 
-        echo "Using AppHost package version: $version"
+        version=$(ls "$pack_dir" | head -n1)
+
+        if [ -z "$version" ]; then
+          echo "::error::pack 目录存在但为空，无法提取版本号"
+          exit 1
+        fi
+
+        echo "从本地 x64 SDK 探测到版本号: $version"
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
     - name: Pack Microsoft.NETCore.App.Host.linux-x86
@@ -211,7 +197,7 @@ jobs:
         name: Microsoft.NETCore.App.Host.linux-x86-nupkg
         path: ${{ github.workspace }}/apphost-pack/out/*.nupkg
 
-    - name: Build (pass 2 - 本地 feed 已就绪，不再需要 UseAppHost=false)
+    - name: Build (本地 feed 已就绪，不再需要 UseAppHost=false)
       run: |
         docker run --platform linux/amd64 --rm \
           -v ${{ github.workspace }}/dotnet:/dotnet \
