@@ -185,6 +185,18 @@ jobs:
         name: Microsoft.NETCore.App.Host.linux-x86-nupkg
         path: ${{ github.workspace }}/apphost-pack/out/*.nupkg
 
+    - name: Re-clone fresh repository for final build (避免复用第一次构建残留的缓存导致版本解析不一致)
+      run: |
+        # 实测发现：两趟构建如果共用同一个 /dotnet 目录，第二趟会复用第一趟残留的
+        # prereqs/packages/archive 缓存（日志里能看到 "...it will not be downloaded"），
+        # 但 --clean-while-building 只清理了 build 自身的 artifacts，不会清理这类底层缓存，
+        # 导致第二趟 restore 解析出版本不一致（大量 NU1202）。VMR 的 source-build 流程设计
+        # 假设每次容器运行只做一次干净构建，我们的两趟构建结构不满足这个假设。
+        # 解决办法：整个删掉第一趟用过的 dotnet 目录，重新完整 clone 一份全新的，
+        # 保证第二趟构建的起点跟第一趟一样干净。
+        rm -rf ${{ github.workspace }}/dotnet
+        git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet ${{ github.workspace }}/dotnet
+
     - name: Build (本地 feed 已就绪，重新完整构建一次)
       run: |
         docker run --platform linux/amd64 --rm \
