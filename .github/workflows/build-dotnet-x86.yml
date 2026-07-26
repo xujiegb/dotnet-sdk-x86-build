@@ -55,15 +55,6 @@ jobs:
         remove-codeql: 'true'
         remove-cached-tools: 'true'
 
-    # 新增：分配 12GB Swap，防止 7GB 物理内存被 .NET 源码编译撑爆
-    - name: Set up Swap Space
-      run: |
-        sudo fallocate -l 12G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        echo "=== Current Memory & Swap ==="
-        free -h
 
     - name: Clone repository
       run: |
