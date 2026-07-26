@@ -1,0 +1,130 @@
+name: Build .NET Linux i686 (32-bit)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dotnet_version:
+        description: '.NET 版本号 (严格限制为 X.Y.1xx，如 8.0.100)'
+        required: true
+        default: '8.0.100'
+      build_target:
+        description: '编译目标 (sdk 或 runtime)'
+        required: true
+        default: 'sdk'
+        type: choice
+        options:
+          - sdk
+          - runtime
+
+jobs:
+  build-i686:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 校验版本号是否符合 Major.Minor.1xx 规则
+      - name: Validate Version (1xx Band Check)
+        run: |
+          VERSION="${{ github.event.inputs.dotnet_version }}"
+          echo "输入版本号: $VERSION"
+          
+          # 正则匹配：主版本.次版本.1xx (例如 8.0.100 ~ 8.0.199)
+          if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.1[0-9]{2}$ ]]; then
+            echo "::error::版本号违规！必须符合 X.Y.1xx 格式 (例如 8.0.100, 8.0.108, 9.0.100)。"
+            exit 1
+          fi
+
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          
+          echo "校验通过: Major=$MAJOR, Minor=$MINOR, Band=1xx"
+          echo "MAJOR=$MAJOR" >> $GITHUB_ENV
+          echo "MINOR=$MINOR" >> $GITHUB_ENV
+          # SDK 源码仓库使用 release/X.Y.1xx 分支
+          echo "BRANCH_SDK=release/$MAJOR.$MINOR.1xx" >> $GITHUB_ENV
+          # Runtime 源码仓库使用 release/X.Y 分支
+          echo "BRANCH_RUNTIME=release/$MAJOR.$MINOR" >> $GITHUB_ENV
+
+      # 2. 清理磁盘空间 (源码编译消耗大量空间)
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+
+      # 3. 配置 32 位 (i386/i686) 交叉编译依赖
+      - name: Setup i386 Cross-Compile Toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-multilib \
+            g++-multilib \
+            clang \
+            cmake \
+            git \
+            curl \
+            tar \
+            libicu-dev:i386 \
+            libssl-dev:i386 \
+            krb5-multidev \
+            zlib1g-dev:i386
+
+      # 4. 拉取指定版本的 .NET SDK 源码 (dotnet/installer)
+      - name: Checkout dotnet/installer (SDK)
+        if: ${{ inputs.build_target == 'sdk' }}
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/installer
+          ref: ${{ env.BRANCH_SDK }}
+          submodules: recursive
+          fetch-depth: 1
+
+      # 5. 拉取指定版本的 .NET Runtime 源码 (dotnet/runtime)
+      - name: Checkout dotnet/runtime (Runtime)
+        if: ${{ inputs.build_target == 'runtime' }}
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: ${{ env.BRANCH_RUNTIME }}
+          submodules: recursive
+          fetch-depth: 1
+
+      # 6. 构建 Linux x86 交叉编译根文件系统 (Sysroot)
+      - name: Generate i686 RootFS
+        run: |
+          ./eng/common/cross/build-rootfs.sh x86
+
+      # 7a. 执行 SDK 构建
+      - name: Build .NET SDK (x86)
+        if: ${{ inputs.build_target == 'sdk' }}
+        run: |
+          ./build.sh /p:Architecture=x86 /p:Configuration=Release
+
+      # 7b. 执行 Runtime 构建
+      - name: Build .NET Runtime (x86)
+        if: ${{ inputs.build_target == 'runtime' }}
+        run: |
+          ./build.sh -s clr+libs -arch x86 -c Release
+
+      # 8. 打包编译产物
+      - name: Package Artifacts
+        run: |
+          mkdir -p dist
+          TARGET="${{ inputs.build_target }}"
+          VERSION="${{ inputs.dotnet_version }}"
+          
+          if [ "$TARGET" = "sdk" ]; then
+            tar -czvf "dist/dotnet-sdk-${VERSION}-linux-x86.tar.gz" -C artifacts/bin/redist/Release/lzma/ . || \
+            tar -czvf "dist/dotnet-sdk-${VERSION}-linux-x86.tar.gz" -C artifacts/bin/ .
+          else
+            tar -czvf "dist/dotnet-runtime-${VERSION}-linux-x86.tar.gz" -C "artifacts/bin/runtime/net${{ env.MAJOR }}.${{ env.MINOR }}-linux-Release-x86" .
+          fi
+
+      # 9. 上传 Artifact 构建包
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-${{ inputs.build_target }}-${{ inputs.dotnet_version }}-linux-i686
+          path: dist/
