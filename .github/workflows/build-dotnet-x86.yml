@@ -68,9 +68,9 @@ jobs:
           exit 1
         fi
 
-        # 在 <packageSources> 标签后插入本地 feed 源。
+        # 在 <clear /> 标签后插入本地 feed 源（必须在 clear 之后，否则会被 clear 清空）。
         # 容器内挂载路径是 /dotnet-local-feed（见下面 docker run 的 -v 参数）。
-        sed -i 's#<packageSources>#<packageSources>\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$NUGET_CONFIG"
+        sed -i '0,/<clear \/>/s#<clear />#<clear />\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$NUGET_CONFIG"
         echo "Patched NuGet.config (相关行):"
         grep -B1 -A1 "local-apphost-feed" "$NUGET_CONFIG"
 
