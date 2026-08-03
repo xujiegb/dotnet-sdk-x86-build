@@ -9,10 +9,10 @@ on:
         type: string
         default: dotnet
       branch:
-        description: 'dotnet/runtime 分支/tag 名（例如 release/10.0 或某个具体 tag）'
+        description: 'dotnet/runtime 分支/tag。分支格式如 release/10.0（不带补丁号）；具体版本用 tag，格式如 v10.0.10（带 v 前缀，跟 VMR 的 v10.0.110 命名规则不同，不要搞混）'
         required: true
         type: string
-        default: release/10.0
+        default: v10.0.10
 
 jobs:
   build:
