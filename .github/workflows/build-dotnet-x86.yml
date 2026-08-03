@@ -59,17 +59,31 @@ jobs:
       run: |
         # 建一个空的本地 feed 目录，第一次构建时它是空的（不影响，反正第一次本来就预期在
         # AppHost restore 处失败），第二次构建前会把打好的 apphost nupkg 放进来。
-        #
-        # 注意：这里不再修改 dotnet/NuGet.config！实测发现，哪怕只是往这份文件里插入一行
-        # 内容（不管插在 <clear /> 前面还是后面），都会导致构建表现得像是被允许做了一次
-        # 不受限的公网 restore，引发大量 NU1202（包版本与 netstandard2.0 不兼容）错误——
-        # 说明 VMR 的 source-build 流程可能依赖这份文件的原始内容做某种校验，一旦被改动
-        # 就会触发完全不同（且错误）的构建分支。
-        #
-        # 改用 MSBuild 的 RestoreAdditionalProjectSources 属性在命令行里追加一个额外的
-        # restore 源，完全不触碰任何配置文件，从源头避开这个未知的连锁反应。
         mkdir -p ${{ github.workspace }}/local-feed
         echo "本地 feed 目录已创建：${{ github.workspace }}/local-feed（容器内路径 /dotnet-local-feed）"
+
+        # 实测证实：无论是 -p:UseAppHost=false 还是 -p:RestoreAdditionalProjectSources=...，
+        # 传给最外层 ./build.sh 的属性都不会渗透到 VMR 内部为 runtime 仓库单独发起的那次
+        # nested build（/dotnet/src/runtime/build.sh --restore --build ...）。
+        # 真正生效的 RestoreConfigFile 是 /dotnet/artifacts/obj/runtime/NuGet.config，
+        # 这个文件是从 src/runtime/NuGet.config（runtime 子仓库自己的配置，不是 VMR 根目录
+        # 那份）派生出来的。之前改根目录 NuGet.config 触发过未知连锁反应（大量 NU1202），
+        # 这次改的是范围小得多、专属于 runtime 子仓库的文件，风险应该不同，直接尝试。
+        RUNTIME_NUGET_CONFIG="${{ github.workspace }}/dotnet/src/runtime/NuGet.config"
+        if [ ! -f "$RUNTIME_NUGET_CONFIG" ]; then
+          echo "::error::未找到 src/runtime/NuGet.config，请检查路径是否变化"
+          find ${{ github.workspace }}/dotnet/src/runtime -maxdepth 1 -iname 'NuGet.config'
+          exit 1
+        fi
+
+        if grep -q '<clear \/>' "$RUNTIME_NUGET_CONFIG"; then
+          sed -i '0,/<clear \/>/s#<clear />#<clear />\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$RUNTIME_NUGET_CONFIG"
+        else
+          sed -i 's#<packageSources>#<packageSources>\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$RUNTIME_NUGET_CONFIG"
+        fi
+
+        echo "Patched src/runtime/NuGet.config 相关行："
+        grep -B1 -A1 "local-apphost-feed" "$RUNTIME_NUGET_CONFIG"
 
     - name: Build & locate apphost binary (第一次构建预期在 AppHost restore 处失败，构建本身产出的 apphost 二进制和 Shipping 包不受影响)
       run: |
@@ -88,7 +102,6 @@ jobs:
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
               -p:MaxCpuCount=3 \
-              -p:RestoreAdditionalProjectSources=/dotnet-local-feed \
         || echo "构建按预期在 AppHost restore 处失败（如果是其他原因失败，下面找不到 apphost 二进制时会报错并停止）"
 
         # 在 native corehost 构建产物里找 32 位 ELF 的 apphost 文件。
@@ -200,6 +213,22 @@ jobs:
         rm -rf ${{ github.workspace }}/dotnet 2>/dev/null || sudo rm -rf ${{ github.workspace }}/dotnet
         git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet ${{ github.workspace }}/dotnet
 
+        # 重新 clone 出来的是全新未修改的仓库，需要对 src/runtime/NuGet.config 再打一次同样的补丁
+        RUNTIME_NUGET_CONFIG="${{ github.workspace }}/dotnet/src/runtime/NuGet.config"
+        if [ ! -f "$RUNTIME_NUGET_CONFIG" ]; then
+          echo "::error::未找到 src/runtime/NuGet.config，请检查路径是否变化"
+          exit 1
+        fi
+
+        if grep -q '<clear \/>' "$RUNTIME_NUGET_CONFIG"; then
+          sed -i '0,/<clear \/>/s#<clear />#<clear />\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$RUNTIME_NUGET_CONFIG"
+        else
+          sed -i 's#<packageSources>#<packageSources>\n    <add key="local-apphost-feed" value="/dotnet-local-feed" />#' "$RUNTIME_NUGET_CONFIG"
+        fi
+
+        echo "重新 clone 后 Patched src/runtime/NuGet.config 相关行："
+        grep -B1 -A1 "local-apphost-feed" "$RUNTIME_NUGET_CONFIG"
+
     - name: Build (本地 feed 已就绪，重新完整构建一次)
       run: |
         docker run --platform linux/amd64 --rm \
@@ -216,8 +245,7 @@ jobs:
               --arch x86 \
               --branding ${{ inputs.branding }} \
               -p:OfficialBuildId=$(date +%Y%m%d).99 \
-              -p:MaxCpuCount=3 \
-              -p:RestoreAdditionalProjectSources=/dotnet-local-feed
+              -p:MaxCpuCount=3
 
     # 无论构建成功还是失败/中断，都打印内核 OOM 日志和内存状态
     - name: Check OOM & System Logs
