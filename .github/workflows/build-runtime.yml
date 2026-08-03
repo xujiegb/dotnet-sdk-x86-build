@@ -1,0 +1,92 @@
+name: Build .NET Runtime (linux-x86, plain build.sh, no source-build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: 'dotnet/runtime fork name (注意：这次直接 clone dotnet/runtime 独立仓库，不是 dotnet/dotnet VMR)'
+        required: true
+        type: string
+        default: dotnet
+      branch:
+        description: 'dotnet/runtime 分支/tag 名（例如 release/10.0 或某个具体 tag）'
+        required: true
+        type: string
+        default: release/10.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Show workflow inputs
+      run: |
+        echo "fork: ${{ inputs.fork }}"
+        echo "branch: ${{ inputs.branch }}"
+
+    - name: Maximize build space
+      uses: AdityaGarg8/remove-unwanted-software@v4.1
+      with:
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-cached-tools: 'true'
+
+    - name: Clone dotnet/runtime repository (独立仓库，不是 VMR)
+      run: |
+        git clone --single-branch --depth 1 -b ${{ inputs.branch }} \
+          https://github.com/${{ inputs.fork }}/runtime \
+          ${{ github.workspace }}/runtime
+
+    # 关键：直接用 runtime 仓库自己的 build.sh，选 clr+libs+host+packs 这几个 subset，
+    # 完全不走 --source-build --fromVMR 这套 VMR 产品级编排流程。
+    # 已由 dotnet/runtime 官方维护者（am11）在 GitHub Issue #77667 里验证过：
+    # 这种方式对 linux-x86 交叉编译完全没有 NETSDK1084 问题，
+    # 问题只在 source-build 编排路径里才会出现（因为那条路径会额外触发 Crossgen2
+    # 组件构建，Crossgen2 依赖一个"活的" apphost，而 NativeAOT 又不支持 linux-x86，
+    # 会 fallback 到需要 apphost 的路径，官方 apphost pack 在 linux-x86 上又不存在）。
+    - name: Build runtime (clr+libs+host+packs, plain build.sh)
+      run: |
+        docker run --platform linux/amd64 --rm \
+          -v ${{ github.workspace }}/runtime:/runtime \
+          -w /runtime \
+          -e ROOTFS_DIR=/crossrootfs/x86 \
+          -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+          -e MSBUILDDISABLENODEREUSE=1 \
+          mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-net10.0-cross-x86 \
+            ./build.sh clr+libs+host+packs -arch x86 -cross -c Release
+
+    - name: List artifacts directory
+      if: always()
+      run: |
+        find ${{ github.workspace }}/runtime/artifacts -maxdepth 4 2>/dev/null || echo "artifacts 目录不存在，构建可能很早期就失败了"
+
+    # 顺便验证一下这条路径产出的 apphost 二进制，跟之前 source-build 路径里
+    # 手工从产物里捞出来的是不是一样能用（32 位 ELF）
+    - name: Locate apphost binary
+      if: always()
+      run: |
+        found=""
+        while IFS= read -r f; do
+          if file "$f" | grep -q "ELF 32-bit"; then
+            found="$f"
+            break
+          fi
+        done < <(find ${{ github.workspace }}/runtime/artifacts -type f -name 'apphost' 2>/dev/null)
+
+        if [ -z "$found" ]; then
+          echo "::warning::未找到 32-bit ELF 的 apphost 二进制，构建可能没有走到这一步"
+        else
+          echo "Found apphost: $found"
+          file "$found"
+        fi
+
+    - name: Upload runtime artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dotnet-runtime-linux-x86-artifacts
+        path: |
+          ${{ github.workspace }}/runtime/artifacts/bin/**
+          ${{ github.workspace }}/runtime/artifacts/packages/**
+        if-no-files-found: warn
