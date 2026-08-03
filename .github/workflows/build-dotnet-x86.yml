@@ -194,7 +194,10 @@ jobs:
         # 假设每次容器运行只做一次干净构建，我们的两趟构建结构不满足这个假设。
         # 解决办法：整个删掉第一趟用过的 dotnet 目录，重新完整 clone 一份全新的，
         # 保证第二趟构建的起点跟第一趟一样干净。
-        rm -rf ${{ github.workspace }}/dotnet
+        # docker 容器内部是以 root 身份跑的（没加 --user 参数），第一趟构建在挂载的
+        # /dotnet 目录里创建了大量 root 属主的文件，普通 rm -rf（runner 用户）删不掉，
+        # 会报 Permission denied 并导致这一步失败，需要 sudo 才能删干净。
+        rm -rf ${{ github.workspace }}/dotnet 2>/dev/null || sudo rm -rf ${{ github.workspace }}/dotnet
         git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet ${{ github.workspace }}/dotnet
 
     - name: Build (本地 feed 已就绪，重新完整构建一次)
